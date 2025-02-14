@@ -1,0 +1,151 @@
+import os
+from torch import concat, float32, no_grad, save, device
+from torch.cuda import is_available
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms.v2 as tfs_v2
+import torch.utils.data as data
+from torch.utils.data import random_split, DataLoader
+from PIL import Image
+from tqdm import tqdm
+
+
+class LoadData(data.Dataset):
+    def __init__(self, path, transform_img=None, transform_mask=None):
+        self.path = path
+        self.transform_img = transform_img
+        self.transform_mask = transform_mask
+
+        folders = [pth for folder in os.listdir(path) if os.path.isdir(pth := os.path.join(path, folder))]
+        self.images = []
+        self.masks = []
+
+        for folder in folders:
+            images = [os.path.join(folder, image) for image in os.listdir(folder)]
+            self.images.extend([images[image] for image in range(0, len(images), 2)])
+            self.masks.extend([images[image] for image in range(1, len(images), 2)])
+
+    def __getitem__(self, item):
+        path_img, path_mask = self.images[item], self.masks[item]
+        img = Image.open(path_img).convert('RGB')
+        mask = Image.open(path_mask).convert('L') # grayscale
+
+        if self.transform_img:
+            img = self.transform_img(img)
+
+        if self.transform_mask:
+            mask = self.transform_mask(mask)
+            mask[mask < 250] = 1
+            mask[mask >= 250] = 0
+
+        return img, mask
+
+    def __len__(self):
+        return len(self.images)
+
+
+class UNetModel(nn.Module):
+    class _Conv2d(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.model = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding="same", bias=False),
+                nn.ReLU(inplace=True),
+                nn.BatchNorm2d(out_channels),
+                nn.Conv2d(out_channels, out_channels, 3, padding="same", bias=False),
+                nn.ReLU(inplace=True),
+                nn.BatchNorm2d(out_channels)
+            )
+
+        def forward(self, x):
+            return self.model(x)
+
+    class CNNLayer(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.conv = UNetModel._Conv2d(in_channels, out_channels)
+            self.max_pool = nn.MaxPool2d(2)
+
+        def forward(self, x):
+            x = self.conv(x)
+            y = self.max_pool(x)
+            return y, x
+
+    class Decoder(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.transpose = nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2)
+            self.block = UNetModel._Conv2d(in_channels, out_channels)
+
+        def forward(self, x, y):
+            x = self.transpose(x)
+            u = concat([x, y], dim=1)
+            u = self.block(u)
+            return u
+
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.enc1 = self.CNNLayer(in_channels, 2)
+
+        self.bottom = self._Conv2d(2, 4)
+
+        self.dec1 = self.Decoder(4, 2)
+
+        self.out = nn.Conv2d(2, out_channels=num_classes, kernel_size=1)
+
+    def forward(self, x):
+        x, y1 = self.enc1(x)
+
+        x = self.bottom(x)
+
+        x = self.dec1(x, y1)
+
+        return self.out(x)
+
+
+if __name__ == "__main__":
+    transform_im = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(float32, scale=True)])
+    transform_msk = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(float32)])
+    dataset = LoadData("E:/Python/Python Projects/PycharmProjects/kaggle_3m",
+                       transform_img=transform_im, transform_mask=transform_msk)
+    train_size = int(0.7 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_set, test_set = random_split(dataset, [train_size, test_size])
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+
+    criterion = nn.BCEWithLogitsLoss()
+    model = UNetModel(3, 1)
+    device = device('cuda' if is_available() else 'cpu')
+    model.to(device)
+    optimizer = optim.Adam(params=model.parameters(), lr=0.001)
+    epochs = 1
+
+    model.train()
+    for epoch in range(epochs):
+        train_tqdm = tqdm(train_loader, leave=True)
+        for x_tr, y_tr in train_tqdm:
+            x_tr, y_tr = x_tr.to(device), y_tr.to(device)
+            predict = model(x_tr)
+            loss = criterion(predict, y_tr)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_tqdm.set_description(f"Loss: {loss.item():.4f}")
+
+
+    model.eval()
+    with no_grad():
+        test_tqdm = tqdm(test_loader, leave=True)
+        for x_t, y_t in test_tqdm:
+            x_t, y_t = x_t.to(device), y_t.to(device)
+            predict = model(x_t)
+            loss = criterion(predict, y_t)
+
+            test_tqdm.set_description(f"Loss: {loss.item():.4f}")
+
+    state = model.state_dict()
+    save(state, 'model_state_final.tar')
+
