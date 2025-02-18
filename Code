@@ -1,5 +1,5 @@
 import os
-from torch import concat, float32, no_grad, save, device
+from torch import concat, float32, no_grad, save, device, tensor, load, exp, sigmoid
 from torch.cuda import is_available
 import torch.nn as nn
 import torch.optim as optim
@@ -8,6 +8,9 @@ import torch.utils.data as data
 from torch.utils.data import random_split, DataLoader
 from PIL import Image
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+import torch.nn.functional as F
 
 
 class LoadData(data.Dataset):
@@ -35,8 +38,8 @@ class LoadData(data.Dataset):
 
         if self.transform_mask:
             mask = self.transform_mask(mask)
-            mask[mask < 250] = 1
-            mask[mask >= 250] = 0
+            mask[mask < 250] = 0
+            mask[mask >= 250] = 1
 
         return img, mask
 
@@ -71,40 +74,91 @@ class UNetModel(nn.Module):
             y = self.max_pool(x)
             return y, x
 
+    class AttentionBlock(nn.Module):
+        def __init__(self, in_channels, gating_channels, inter_channels):
+            super().__init__()
+            self.W_g = nn.Sequential(
+                nn.Conv2d(gating_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm2d(inter_channels)
+            )
+            self.W_x = nn.Sequential(
+                nn.Conv2d(in_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm2d(inter_channels)
+            )
+            self.psi = nn.Sequential(
+                nn.Conv2d(inter_channels, 1, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm2d(1),
+                nn.Sigmoid()
+            )
+            self.relu = nn.ReLU(inplace=True)
+
+        def forward(self, g, x):
+            g1 = self.W_g(g)
+            x1 = self.W_x(x)
+            psi = self.relu(g1 + x1)
+            psi = self.psi(psi)
+            return x * psi
+
     class Decoder(nn.Module):
-        def __init__(self, in_channels, out_channels):
+        def __init__(self, in_channels, out_channels, attention=False):
             super().__init__()
             self.transpose = nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2)
             self.block = UNetModel._Conv2d(in_channels, out_channels)
+            self.attention = UNetModel.AttentionBlock(in_channels=out_channels, gating_channels=out_channels, inter_channels=out_channels // 2) if attention else None
 
         def forward(self, x, y):
             x = self.transpose(x)
+            if self.attention is not None:
+                y = self.attention(g=x, x=y)
             u = concat([x, y], dim=1)
             u = self.block(u)
             return u
 
     def __init__(self, in_channels, num_classes):
         super().__init__()
-        self.enc1 = self.CNNLayer(in_channels, 2)
+        self.enc1 = self.CNNLayer(in_channels, 16)
+        self.enc2 = self.CNNLayer(16, 32)
+        self.enc3 = self.CNNLayer(32, 64)
 
-        self.bottom = self._Conv2d(2, 4)
+        self.bottom = self._Conv2d(64, 128)
 
-        self.dec1 = self.Decoder(4, 2)
+        self.dec1 = self.Decoder(128, 64, True)
+        self.dec2 = self.Decoder(64, 32, True)
+        self.dec3 = self.Decoder(32, 16, True)
 
-        self.out = nn.Conv2d(2, out_channels=num_classes, kernel_size=1)
+        self.out = nn.Conv2d(16, out_channels=num_classes, kernel_size=1)
 
     def forward(self, x):
         x, y1 = self.enc1(x)
+        x, y2 = self.enc2(x)
+        x, y3 = self.enc3(x)
 
         x = self.bottom(x)
 
-        x = self.dec1(x, y1)
-
+        x = self.dec1(x, y3)
+        x = self.dec2(x, y2)
+        x = self.dec3(x, y1)
         return self.out(x)
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        logits = sigmoid(logits)
+        intersection = (logits * targets).sum()
+        union = logits.sum() + targets.sum()
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice
 
 
 if __name__ == "__main__":
     transform_im = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(float32, scale=True)])
+    aug = tfs_v2.Compose([tfs_v2.RandomHorizontalFlip(),
+    tfs_v2.RandomVerticalFlip(),
+    tfs_v2.RandomRotation(30)])
     transform_msk = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(float32)])
     dataset = LoadData("E:/Python/Python Projects/PycharmProjects/kaggle_3m",
                        transform_img=transform_im, transform_mask=transform_msk)
@@ -113,13 +167,15 @@ if __name__ == "__main__":
     train_set, test_set = random_split(dataset, [train_size, test_size])
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
-
-    criterion = nn.BCEWithLogitsLoss()
-    model = UNetModel(3, 1)
     device = device('cuda' if is_available() else 'cpu')
+    weight = tensor([1.6]).to(device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=weight)
+    criterion2 = DiceLoss()
+    model = UNetModel(3, 1)
     model.to(device)
-    optimizer = optim.Adam(params=model.parameters(), lr=0.001)
-    epochs = 1
+    optimizer = optim.Adam(params=model.parameters(), lr=0.001, weight_decay=1e-5)
+    epochs = 2
 
     model.train()
     for epoch in range(epochs):
@@ -135,7 +191,8 @@ if __name__ == "__main__":
 
             train_tqdm.set_description(f"Loss: {loss.item():.4f}")
 
-
+    mean_loss_BCE = []
+    mean_loss_dice = []
     model.eval()
     with no_grad():
         test_tqdm = tqdm(test_loader, leave=True)
@@ -143,9 +200,11 @@ if __name__ == "__main__":
             x_t, y_t = x_t.to(device), y_t.to(device)
             predict = model(x_t)
             loss = criterion(predict, y_t)
+            mean_loss_BCE.append(loss.item())
+            loss = criterion2(predict, y_t)
+            mean_loss_dice.append(loss.item())
 
-            test_tqdm.set_description(f"Loss: {loss.item():.4f}")
-
+    print(f"Mean BCE loss: {sum(mean_loss_BCE) / len(mean_loss_BCE)}")
+    print(f"Mean dice loss: {sum(mean_loss_dice) / len(mean_loss_dice)}")
     state = model.state_dict()
     save(state, 'model_state_final.tar')
-
