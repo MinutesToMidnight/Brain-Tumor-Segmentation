@@ -10,7 +10,6 @@ from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
-import torch.nn.functional as F
 
 
 class LoadData(data.Dataset):
