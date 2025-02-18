@@ -207,3 +207,8 @@ if __name__ == "__main__":
     print(f"Mean dice loss: {sum(mean_loss_dice) / len(mean_loss_dice)}")
     state = model.state_dict()
     save(state, 'model_state_final.tar')
+
+
+# Output
+# Mean BCE loss: 0.0038078715821720805
+# Mean dice loss: 0.8489469088064199
